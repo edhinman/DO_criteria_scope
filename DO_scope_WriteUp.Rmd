@@ -1,0 +1,211 @@
+---
+title: "Dissolved Oxygen Assessment Scope"
+author: "Elise Hinman"
+date: '2022-04-11'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(wqTools)
+library(tidyr)
+library(dplyr)
+library(leaflet)
+```
+
+## Purpose
+
+The Utah Division of Water Quality (DWQ) discovered that the dissolved oxygen criteria for cold water aquatic life was sometimes not attainable under ambient conditions at high elevations due to the decrease in dissolved oxygen concentration at 100% saturation. In response to this issue, DWQ proposes a new interpretation of dissolved oxygen criteria that incorporates dissolved oxygen saturation as a factor in determining the criteria used. Following EPA's Gold Book, the criteria will read: "Where natural conditions alone create dissolved oxygen concentrations less than 110 percent of the applicable criteria means or minima or both, the minimum acceptable concentration is 90 percent of the natural concentration." 
+
+In practice, this new interpretation requires calculation of 100% saturation given a data point's barometric pressure, water temperature, and salinity. If the concentration at 100% saturation is less than 1.1 times the applicable cold water aquatic life dissolved oxygen criterion, the criterion will be the dissolved oxygen concentration at that site at 90% saturation (or 0.9 times the concentration at 100% saturation). 
+
+## Summary of scoping project
+
+I used the Benson and Krause (1980 and 1984) equations from the [USGS Office of Water Quality Technical Memorandum of 2011](https://water.usgs.gov/water-resources/memos/documents/WQ.2011.03.pdf) to calculate dissolved oxygen concentrations at 100% saturation at all sites with the cold water aquatic life use for which DWQ collected dissolved oxygen, temperature, and specific conductance between October 1, 2014 and September 30, 2020 (the period of record of the 2022 Integrated Report). I then determined whether each observed dissolved oxygen concentration exceeded (a) the original dissolved oxygen concentrations and (b) saturation-dependent dissolved oxygen concentrations. These data points were aggregated into percent exceedances for each criterion, and then I grouped sites based on the outcome of the current and proposed dissolved oxygen criteria. 
+
+The code blocks below document the process I took to carry out the scoping exercise.
+
+## Workflow
+
+### Pull data from EPA's Water Quality Portal
+Using the WQP GUI, I selected all stream sites in UT with water data from the 2022 Integrated Report period of record with dissolved oxygen, temperature, and specific conductance data, and at least 10 site visits.
+```{r queries, eval=F}
+# sites - https://www.waterqualitydata.us/#statecode=US%3A49&siteType=Stream&startDateLo=10-01-2014&startDateHi=09-30-2020&sampleMedia=Water&mimeType=csv&sorted=no&providers=NWIS&providers=STEWARDS&providers=STORET
+
+# data - https://www.waterqualitydata.us/#statecode=US%3A49&siteType=Stream&sampleMedia=Water&characteristicName=Dissolved%20oxygen%20(DO)&characteristicName=Temperature%2C%20water&characteristicName=Specific%20conductance&startDateLo=10-01-2014&startDateHi=09-30-2020&minactivities=10&mimeType=csv&dataProfile=narrowResult&providers=NWIS&providers=STEWARDS&providers=STORET
+```
+
+I then subsetted the sites dataset to those sites with a 3A cold water aquatic life use, and grabbed the associated data. These data were them averaged to a daily value for DO, temperature, and specific conductivity, and widened the dataset so there is a separate column for each WQ parameter. Only site-dates with DO, temperature, and specific conductance were kept for analysis.
+
+```{r tidy1}
+# Read in sites and assign beneficial uses, then filter to data at 3A sites
+sites = read.csv("station.csv")
+sites_aus = wqTools::assignUses(sites, lat = "LatitudeMeasure",long= "LongitudeMeasure", flatten=TRUE)
+sites_3A = subset(sites_aus, sites_aus$BeneficialUse=="3A")
+
+dat = read.csv("narrowresult.csv")
+dat_3A = subset(dat, dat$MonitoringLocationIdentifier%in%sites_3A$MonitoringLocationIdentifier)
+
+dat_3A_wide = dat_3A%>%
+  group_by(ActivityStartDate,MonitoringLocationIdentifier,CharacteristicName,ResultMeasure.MeasureUnitCode)%>%
+  summarise(IR_Value = mean(ResultMeasureValue))%>%
+  pivot_wider(id_cols = c(ActivityStartDate,MonitoringLocationIdentifier),names_from = CharacteristicName, values_from = IR_Value)
+
+dat_comp = subset(dat_3A_wide,!is.na(dat_3A_wide$`Dissolved oxygen (DO)`)&!is.na(dat_3A_wide$`Specific conductance`)&!is.na(dat_3A_wide$`Temperature, water`))
+
+dat1 = merge(dat_comp, sites, all.x = TRUE)
+
+head(dat1)
+```
+
+### Determine site elevation
+The next step was to assign elevations to each site to calculate dissolved oxygen concentration at 100% saturation. I had some challenges using the R package elevatr (need admin rights), and my ArcGIS Pro did not have the proper tools loaded to assign a DEM to the site coordinates, but I used the [USGS TNM site](https://apps.nationalmap.gov/elevation/) to upload a .txt file and assign elevations to each site.
+```{r elevation}
+# lat_long = unique(dat1[,c("LatitudeMeasure","LongitudeMeasure","MonitoringLocationIdentifier")])
+# write.csv(lat_long,"elevation_sites.csv", row.names = FALSE)
+# # Get elevation for each site - doesn't work if not admin
+# library(elevatr, sp)
+# lat_long1 = sp::SpatialPointsDataFrame(coords=lat_long[,c("LatitudeMeasure","LongitudeMeasure")],lat_long)
+# lat_long2 = get_elev_point(lat_long[,c("LatitudeMeasure","LongitudeMeasure")],prj="EPSG:4326",src="epqs")
+
+# Used USGS site to assign elevations because GIS wasn't working either. https://apps.nationalmap.gov/elevation/##bottom4
+site_elev = read.csv("UT_Statewide_30m_DEM/elevation_sites_m.csv")
+site_elev = merge(site_elev, sites_3A, all.x = TRUE)
+
+head(site_elev)
+```
+
+### Benson and Krause equation functions
+The Benson and Krause equations used to determine dissolved oxygen concentration at 100% saturation require barometric pressure, temperature (in Celcius and Kelvin), and specific conductivity (to calculate salinity). The overall equation is:
+
+DO = DO (baseline)* Correction Factor(salinity) * Correction Factor(pressure)
+
+The functions below were needed to come up with these three variables needed in the overall equation.
+```{r equations}
+
+# Barometric pressure in atmospheres given elevation assuming 20 degrees Celcius
+baro_p = function(x,temp=20){
+  tempK = temp+273.15
+  p0 = 1 # atm at sea level
+  g = 9.80665 # m/s^2
+  M = 0.0289644 # kg/mol
+  R = 8.3144598 # J/(mol*K)
+  ph = p0*exp((-g*M*x)/(R*tempK))
+  return(ph)
+}
+
+# DO baseline
+DO_baseline <- function(tempK){
+  out = exp(-139.34411+(1.575701*10^5/tempK)-(6.642308*10^7/(tempK^2))+(1.243800*10^10/(tempK^3))-(8.621949*10^11/(tempK^4)))
+  return(out)
+}
+
+# Salinity
+Salinity <- function(SC){
+  out = 5.572*10^(-4)*SC+2.02*10^(-9)*SC^2
+  return(out)
+}
+
+# Salinity correction factor
+Fs <- function(S,TK){
+  out = exp(-S*(0.017674-(10.754/TK)+(2140.7/(TK^2))))
+  return(out)
+}
+
+# Pressure correction factor
+Fp <- function(P,t,TK){
+  theta = 0.000975-1.426*10^(-5)*t+6.436*10^(-8)*t^2
+  u = exp(11.8571-(3840.70/TK)-(216961/(TK^2)))
+  out = ((P-u)*(1-theta*P))/((1-u)*(1-theta))
+  return(out)
+}
+
+```
+
+I then used these functions to calculate dissolved oxygen concentrations at 100% saturation within the dataset.
+
+```{r calcs}
+# Calculate barometric pressure for each site
+site_elev$Barometric_Pressure_atm = baro_p(site_elev$Elev_m)
+
+# Calculate water temperature in Kelvin
+dat2 = merge(dat1, site_elev, all.x = TRUE)
+dat2$Temperature_K = dat2$`Temperature, water`+273.15
+
+# Calculate baseline, salinity, and correction factors
+dat2$DO_baseline = DO_baseline(dat2$Temperature_K)
+dat2$Salinity = Salinity(dat2$`Specific conductance`)
+dat2$Fs = Fs(dat2$Salinity,dat2$Temperature_K)
+dat2$Fp = Fp(dat2$Barometric_Pressure_atm,dat2$`Temperature, water`,dat2$Temperature_K)
+
+# Calculate DO concentration
+dat2$DO_100sat = dat2$DO_baseline*dat2$Fs*dat2$Fp
+
+hist(dat2$DO_100sat, main="Histogram of [DO] at 100% Saturation", xlab="Concentration",ylab="Number of Concentration Values")
+```
+
+### Using 100% saturation to determine appropriate criterion
+
+With the concentration calculated, I then needed to determine the applicable criterion. I calculated the concentration at 90% saturation, and then created columns for each criterion (7-day, minimum, 7-day using saturation, minimum using saturation). The former two criteria were static values (9.5 mg/L and 8 mg/L respectively), and the latter two were contingent upon whether the concentration at 100% saturation was less than 110% of the applicable criterion. If 100% saturation was less than 110% of the criterion, the dissolved oxygen concentration at 90% saturation was used as the criterion.
+
+```{r criteria}
+dat2$DO_90sat = dat2$DO_100sat*0.9
+dat2$Crit_7day = 9.5
+dat2$Crit_min = 8
+dat2$Crit_7day_sat = ifelse(dat2$DO_100sat<1.1*9.5,dat2$DO_90sat,9.5)
+dat2$Crit_min_sat = ifelse(dat2$DO_100sat<1.1*8,dat2$DO_90sat,8)
+head(dat2)
+```
+
+### Scoping effect of criteria used
+
+I then lengthened the dataset so that each DO observation was repeated over each criterion, and determined which samples exceeded (were lower than) the criterion. Then, grouping by site and criterion, I determined the DO ncount, the number of exceedances for each criterion, and the percent exceedance. I removed instance where there were fewer than 10 DO samples to assess. 
+```{r assess}
+dat3 = dat2[,c("MonitoringLocationIdentifier","ActivityStartDate","Dissolved oxygen (DO)","Crit_7day","Crit_min","Crit_7day_sat","Crit_min_sat")]
+dat3_long = dat3%>%pivot_longer(cols=c("Crit_7day","Crit_min","Crit_7day_sat","Crit_min_sat"),names_to = "Criterion_Name",values_to = "Criterion")
+dat3_long$Exceeds = ifelse(dat3_long$`Dissolved oxygen (DO)`<dat3_long$Criterion,1,0)
+
+dat4 = dat3_long%>%group_by(MonitoringLocationIdentifier,Criterion_Name)%>%summarise(Ncount = length(Exceeds), Num_Exceeds = sum(Exceeds), Perc_Exc = sum(Exceeds)/length(Exceeds)*100)
+dat4 = subset(dat4, dat4$Ncount>9)
+head(dat4)
+```
+
+Next, I generalized criteria based on whether they were the current usage of the DO criteria, or the proposed saturation-based criteria, and determined whether each type of criteria led to an impairment of each site. 
+```{r}
+dat4$Impaired = ifelse(dat4$Perc_Exc>10,1,0)
+dat4$Type = ifelse(grepl("sat",dat4$Criterion_Name), "Saturation-based","Original concentration")
+
+dat5 = dat4%>%group_by(MonitoringLocationIdentifier,Type)%>%summarise(Impaired = ifelse(any(Impaired==1),"Yes","No"))%>%pivot_wider(id_cols = MonitoringLocationIdentifier,names_from = Type, values_from = Impaired)
+dat5 = merge(dat5, unique(dat4[,c("MonitoringLocationIdentifier","Ncount")]), all.x=TRUE)
+head(dat5)
+```
+
+Finally, I categorized each site based on its impairment status under the two criteria scenarios. In most cases, the original implementation of the DO criteria led to an impairment, while the incorporation of % saturation led to a fully supporting assessment. The map below shows where the assessment scenarios were (blue, red markers)/were not (purple markers) in agreement.
+```{r map}
+dat5 = merge(dat5, site_elev, all.x=TRUE)
+dat5$color = "purple"
+dat5$color[dat5$`Original concentration`=="Yes"&dat5$`Saturation-based`=="Yes"] = "red"
+dat5$color[dat5$`Original concentration`=="No"&dat5$`Saturation-based`=="No"] = "blue"
+dat5$note = "Impaired with original concentration criteria, not impaired using saturation-based criteria"
+dat5$note[dat5$`Original concentration`=="Yes"&dat5$`Saturation-based`=="Yes"] = "Impaired using both types of criteria"
+dat5$note[dat5$`Original concentration`=="No"&dat5$`Saturation-based`=="No"] = "Not impaired"
+
+
+m = wqTools::baseMap()%>%
+  addCircleMarkers(data=dat5, lat=dat5$LatitudeMeasure, lng=dat5$LongitudeMeasure, color=dat5$color,
+                   popup = paste0(
+                     "Monitoring Location ID: ",dat5$MonitoringLocationIdentifier,
+                     "<br> Monitoring Location Name: ",dat5$MonitoringLocationName,
+                     "<br> Elevation: ",dat5$Elev_m,
+                     "<br> Ncount: ",dat5$Ncount,
+                     "<br> Description: ",dat5$note
+                   ))
+m
+```
+
+```{r plot}
+cats = dat5%>%group_by(note, color)%>%summarise(ncount = length(note))
+p = plotly::plot_ly(x = c("Impaired","Depends","Supporting"),y=cats$ncount,text=cats$ncount, type="bar", marker = list(color = cats$color, line=list(color=cats$color)))%>%plotly::layout(font=list(family="Arial"))
+p
+```
+
